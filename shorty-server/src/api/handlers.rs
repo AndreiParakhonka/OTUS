@@ -6,32 +6,44 @@ use std::time::{Duration, SystemTime};
 
 use axum::{
     Json,
-    extract::{Path, State},
-    http::{StatusCode, header},
+    extract::{Path, Query, State},
+    http::{HeaderMap, StatusCode, header},
     response::IntoResponse,
 };
 use domain::{RepoError, ShortLink};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::{
     dto::{
-        CreateLinkRequest, LinkResponse, expires_at_from_ttl, parse_target_url,
-        validate_custom_code,
+        CreateLinkRequest, LinkResponse, LinkStatsWindowResponse, TopLinkResponse,
+        expires_at_from_ttl, parse_target_url, unix_secs, validate_custom_code,
     },
     error::{AppError, AppJson},
 };
-use crate::AppState;
+use crate::{AppState, rate_limit::Allowance};
 
 // ---------------------------------------------------------------------------
 // CRUD ссылок
 // ---------------------------------------------------------------------------
 
 /// `POST /api/v1/links` — создать ссылку.
-/// `201` + `Location` + тело; `422` при невалидных данных; `409` если код занят.
+/// `201` + `Location` + тело; `422` при невалидных данных; `409` если код занят;
+/// `429` при превышении rate limit (см. `rate_limit`).
 pub async fn create_link(
     State(state): State<AppState>,
+    headers: HeaderMap,
     AppJson(req): AppJson<CreateLinkRequest>,
 ) -> Result<impl IntoResponse, AppError> {
+    // Rate limit «10 созданий в минуту с клиента». Клиента определяем по
+    // `X-Forwarded-For` (за прокси) либо по `X-Api-Key`, иначе — «unknown».
+    let client = client_key(&headers);
+    match state.rate_limiter.check(&client).await {
+        Allowance::Allowed => {}
+        Allowance::Denied { retry_after } => {
+            return Err(AppError::RateLimited { retry_after });
+        }
+    }
+
     let target_url = parse_target_url(&req.target_url)?;
     let expires_at = expires_at_from_ttl(req.ttl_seconds)?;
 
@@ -101,6 +113,78 @@ pub async fn delete_link(
 /// а не пустое тело по умолчанию.
 pub async fn fallback_404() -> AppError {
     AppError::NotFound
+}
+
+// ---------------------------------------------------------------------------
+// Статистика
+// ---------------------------------------------------------------------------
+
+/// `GET /api/v1/links/{code}/stats` — переходы за всё время и за последние
+/// 60 секунд (скользящее окно, реализовано в хранилище).
+pub async fn link_stats(
+    State(state): State<AppState>,
+    Path(code): Path<String>,
+) -> Result<Json<LinkStatsWindowResponse>, AppError> {
+    let total = state.repo.stats(&code).await?;
+    let window = state
+        .repo
+        .stats_window(&code, Duration::from_secs(60))
+        .await?;
+    Ok(Json(LinkStatsWindowResponse {
+        code: total.link.code.clone(),
+        target_url: total.link.target_url,
+        created_at_unix: unix_secs(total.link.created_at),
+        expires_at_unix: total.link.expires_at.map(unix_secs),
+        total_hits: total.hits,
+        hits_last_60s: window.hits,
+    }))
+}
+
+/// Query-параметры `GET /api/v1/stats/top`.
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub struct TopQuery {
+    /// Сколько строк вернуть (по умолчанию 10, максимум 100).
+    pub limit: Option<usize>,
+}
+
+/// `GET /api/v1/stats/top?limit=N` — топ-N ссылок по числу переходов.
+pub async fn top_links(
+    State(state): State<AppState>,
+    Query(query): Query<TopQuery>,
+) -> Result<Json<Vec<TopLinkResponse>>, AppError> {
+    let limit = query.limit.unwrap_or(10).clamp(1, 100);
+    let top = state.repo.top(limit).await?;
+    let response: Vec<TopLinkResponse> = top
+        .into_iter()
+        .map(|t| TopLinkResponse {
+            code: t.code,
+            hits: t.hits,
+        })
+        .collect();
+    Ok(Json(response))
+}
+
+/// Ключ клиента для rate limiter'а: IP (из `X-Forwarded-For`) или
+/// `X-Api-Key`. Задокументировано в README.
+fn client_key(headers: &HeaderMap) -> String {
+    if let Some(ip) = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        return ip
+            .split(',')
+            .next()
+            .map(str::trim)
+            .unwrap_or(ip)
+            .to_string();
+    }
+    if let Some(key) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
+        return key.trim().to_string();
+    }
+    "unknown".to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -175,21 +259,4 @@ pub async fn version() -> Json<Version> {
     Json(Version {
         version: env!("CARGO_PKG_VERSION"),
     })
-}
-
-/// ПРАВИЛЬНО: блокирующая работа — в blocking-пуле (урок 3).
-pub async fn slow() -> &'static str {
-    tokio::task::spawn_blocking(|| {
-        std::thread::sleep(Duration::from_secs(2));
-    })
-    .await
-    .expect("blocking task panicked");
-    "done: spawn_blocking kept workers free\n"
-}
-
-/// НАМЕРЕННО СЛОМАНО (демонстрация урока 3): синхронный sleep
-/// монополизирует worker-поток. См. README.
-pub async fn slow_blocking() -> &'static str {
-    std::thread::sleep(Duration::from_secs(2));
-    "done: but a worker thread was blocked for 2s!\n"
 }

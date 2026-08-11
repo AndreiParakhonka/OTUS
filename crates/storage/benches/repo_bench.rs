@@ -15,6 +15,8 @@ use domain::ShortLink;
 use storage::{DashMapRepo, InMemoryRepo, InMemoryRepoV1};
 
 const THREADS: u64 = 8;
+/// Окно «за последние N секунд» — для бенча фиксируем 60 с.
+const WINDOW: Duration = Duration::from_secs(60);
 
 /// Выполняет `iters` операций (95% hit / 5% get), поровну распределённых
 /// по 8 потокам, и возвращает суммарное время стены.
@@ -62,7 +64,7 @@ fn bench_hot_link(c: &mut Criterion) {
             run_mixed(
                 iters,
                 &|| {
-                    std::hint::black_box(v2.record_hit("hot").unwrap());
+                    std::hint::black_box(v2.record_hit("hot", WINDOW).unwrap());
                 },
                 &|| {
                     std::hint::black_box(v2.get("hot").unwrap());
@@ -79,7 +81,7 @@ fn bench_hot_link(c: &mut Criterion) {
             run_mixed(
                 iters,
                 &|| {
-                    std::hint::black_box(v3.record_hit("hot").unwrap());
+                    std::hint::black_box(v3.record_hit("hot", WINDOW).unwrap());
                 },
                 &|| {
                     std::hint::black_box(v3.get("hot").unwrap());

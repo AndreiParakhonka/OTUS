@@ -19,33 +19,72 @@ use domain::ShortLink;
 use http_body_util::BodyExt;
 use serde::de::DeserializeOwned;
 use shorty_server::{
-    AppState, Config,
-    api::{dto::LinkResponse, error::ErrorBody},
+    AppState, Config, RATE_LIMIT_WINDOW,
+    api::{
+        dto::{LinkResponse, LinkStatsWindowResponse, TopLinkResponse},
+        error::ErrorBody,
+    },
     build_router,
+    rate_limit::SharedRateLimiter,
 };
 use storage::InMemoryRepo;
 use tower::ServiceExt;
 
 fn test_state() -> (AppState, Arc<InMemoryRepo>) {
     let repo = Arc::new(InMemoryRepo::new());
+    let config = Arc::new(Config::default());
+    let rate_limiter = Arc::new(SharedRateLimiter::new(
+        config.rate_limit_per_minute,
+        RATE_LIMIT_WINDOW,
+        config.rate_limit_max_clients,
+    ));
     let state = AppState {
         repo: repo.clone(),
-        config: Arc::new(Config::default()),
+        config,
+        rate_limiter,
     };
     (state, repo)
+}
+
+/// Состояние с узким лимитом rate limiter'а — для детерминированного теста 429.
+fn state_with_rate_limit(per_minute: usize) -> AppState {
+    let repo = Arc::new(InMemoryRepo::new());
+    AppState {
+        repo,
+        config: Arc::new(Config {
+            rate_limit_per_minute: per_minute,
+            ..Config::default()
+        }),
+        rate_limiter: Arc::new(SharedRateLimiter::new(
+            per_minute,
+            RATE_LIMIT_WINDOW,
+            10_000,
+        )),
+    }
 }
 
 fn app() -> Router {
     build_router(test_state().0)
 }
 
+fn app_with_state(state: AppState) -> Router {
+    build_router(state)
+}
+
 fn post_json(uri: &str, body: serde_json::Value) -> Request<Body> {
-    Request::builder()
+    post_json_from(uri, body, None)
+}
+
+/// POST с указанием клиента (`X-Forwarded-For`) — управление rate limit.
+fn post_json_from(uri: &str, body: serde_json::Value, client: Option<&str>) -> Request<Body> {
+    let mut builder = Request::builder()
         .method("POST")
         .uri(uri)
-        .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
-        .body(Body::from(body.to_string()))
-        .unwrap()
+        .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref());
+    if let Some(client) = client {
+        builder = builder.header("x-forwarded-for", client);
+    }
+    builder.body(Body::from(body.to_string())).unwrap()
 }
 
 fn get(uri: &str) -> Request<Body> {
@@ -319,9 +358,9 @@ async fn expired_link_is_gone_from_outside() {
 // Конкурентный тест: state под параллельной нагрузкой
 // ---------------------------------------------------------------------------
 
-/// 50 задач параллельно дёргают redirect — счётчик ровно 50.
+/// 100 задач параллельно дёргают redirect — счётчик ровно 100.
 /// `flavor = "multi_thread"` обязателен: однопоточный runtime исполняет
-/// задачи по очереди и не поймал бы гонку.
+/// задачи по очереди и не поймал бы гонку. ДЗ требует >= 100 задач.
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_redirects_count_exactly() {
     let app = app();
@@ -334,7 +373,7 @@ async fn concurrent_redirects_count_exactly() {
         .unwrap();
 
     let mut handles = Vec::new();
-    for _ in 0..50 {
+    for _ in 0..100 {
         let app = app.clone();
         handles.push(tokio::spawn(async move {
             let response = app.oneshot(get("/stress")).await.unwrap();
@@ -347,5 +386,176 @@ async fn concurrent_redirects_count_exactly() {
 
     let response = app.oneshot(get("/api/v1/links/stress")).await.unwrap();
     let stats: LinkResponse = json_body(response).await;
-    assert_eq!(stats.hits, 50);
+    assert_eq!(stats.hits, 100);
+}
+
+// ---------------------------------------------------------------------------
+// ДЗ: статистика окна, топ, rate limit, конкурентное создание
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn link_stats_window_reports_total_and_recent() {
+    let app = app();
+    app.clone()
+        .oneshot(post_json(
+            "/api/v1/links",
+            serde_json::json!({"target_url": "https://example.com/", "custom_code": "stat"}),
+        ))
+        .await
+        .unwrap();
+    // 3 перехода сейчас (попадут и в общий счётчик, и в окно 60 с).
+    for _ in 0..3 {
+        app.clone().oneshot(get("/stat")).await.unwrap();
+    }
+
+    let response = app.oneshot(get("/api/v1/links/stat/stats")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let stats: LinkStatsWindowResponse = json_body(response).await;
+    assert_eq!(stats.total_hits, 3);
+    assert_eq!(stats.hits_last_60s, 3);
+}
+
+#[tokio::test]
+async fn stats_top_returns_ranked_links() {
+    let app = app();
+    // Создаём три ссылки с разной популярностью.
+    for (code, count) in [("a-link", 1u32), ("b-link", 5), ("c-link", 3)] {
+        app.clone()
+            .oneshot(post_json(
+                "/api/v1/links",
+                serde_json::json!({
+                    "target_url": format!("https://example.com/{code}"),
+                    "custom_code": code,
+                }),
+            ))
+            .await
+            .unwrap();
+        for _ in 0..count {
+            app.clone().oneshot(get(&format!("/{code}"))).await.unwrap();
+        }
+    }
+
+    let response = app
+        .clone()
+        .oneshot(get("/api/v1/stats/top?limit=2"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let top: Vec<TopLinkResponse> = json_body(response).await;
+    assert_eq!(top.len(), 2);
+    assert_eq!(top[0].code, "b-link");
+    assert_eq!(top[1].code, "c-link");
+
+    // default limit=10, но ссылок всего 3 → вернутся все.
+    let response = app.oneshot(get("/api/v1/stats/top")).await.unwrap();
+    let top: Vec<TopLinkResponse> = json_body(response).await;
+    assert_eq!(top.len(), 3);
+    assert_eq!(top[0].code, "b-link");
+}
+
+#[tokio::test]
+async fn rate_limit_returns_429_with_retry_after() {
+    let app = app_with_state(state_with_rate_limit(2));
+    let payload =
+        serde_json::json!({"target_url": "https://example.com/", "custom_code": "x-link"});
+
+    // Первые два создания с одного клиента — успех.
+    for i in 0..2 {
+        let response = app
+            .clone()
+            .oneshot(post_json_from(
+                "/api/v1/links",
+                serde_json::json!({
+                    "target_url": format!("https://example.com/r{i}"),
+                    "custom_code": format!("cl-{i}"),
+                }),
+                Some("1.2.3.4"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    // Третий — 429 с Retry-After и единым форматом.
+    let response = app
+        .oneshot(post_json_from("/api/v1/links", payload, Some("1.2.3.4")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        response.headers().get(header::RETRY_AFTER).is_some(),
+        "429 обязан нести Retry-After"
+    );
+    let error: ErrorBody = json_body(response).await;
+    assert_eq!(error.code, "rate_limited");
+    assert!(error.request_id.is_some());
+}
+
+#[tokio::test]
+async fn rate_limit_is_per_client() {
+    let app = app_with_state(state_with_rate_limit(1));
+    let body = serde_json::json!({"target_url": "https://example.com/"});
+
+    // Клиент A исчерпал лимит (второй запрос — 429).
+    let r = app
+        .clone()
+        .oneshot(post_json_from(
+            "/api/v1/links",
+            body.clone(),
+            Some("10.0.0.1"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::CREATED);
+    let r = app
+        .clone()
+        .oneshot(post_json_from(
+            "/api/v1/links",
+            body.clone(),
+            Some("10.0.0.1"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    // Клиент B не затронут.
+    let r = app
+        .oneshot(post_json_from("/api/v1/links", body, Some("10.0.0.2")))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::CREATED);
+}
+
+/// Конкурентное создание с одинаковым custom_code: ровно один 201, остальные 409.
+/// Каждая задача — «свой клиент» (уникальный X-Forwarded-For), чтобы rate limit
+/// не вмешивался в проверку атомарности вставки кода.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_create_same_code_single_success() {
+    let app = app();
+    let mut handles = Vec::new();
+    for i in 0..20u32 {
+        let app = app.clone();
+        handles.push(tokio::spawn(async move {
+            let client = format!("7.7.{}.{}", i % 256, i);
+            let response = app
+                .oneshot(post_json_from(
+                    "/api/v1/links",
+                    serde_json::json!({"target_url": "https://example.com/", "custom_code": "dupe"}),
+                    Some(&client),
+                ))
+                .await
+                .unwrap();
+            response.status()
+        }));
+    }
+    let mut created = 0;
+    for handle in handles {
+        let status = handle.await.unwrap();
+        if status == StatusCode::CREATED {
+            created += 1;
+        } else {
+            assert_eq!(status, StatusCode::CONFLICT);
+        }
+    }
+    assert_eq!(created, 1, "ровно одна задача должна выиграть вставку кода");
 }

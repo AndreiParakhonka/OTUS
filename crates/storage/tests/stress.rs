@@ -8,12 +8,17 @@
 //! Тесты работают с синхронным ядром хранилищ (инхерентные методы),
 //! поэтому runtime tokio им не нужен.
 
+use std::time::Duration;
+
 use domain::ShortLink;
 use storage::{DashMapRepo, InMemoryRepo, InMemoryRepoV1, broken::LostUpdateRepo};
 
 const THREADS: usize = 8;
 const HITS_PER_THREAD: usize = 10_000;
 const TOTAL: u64 = (THREADS * HITS_PER_THREAD) as u64;
+/// Окно «за последние N секунд»  не влияет на коррекность счётчика,
+/// все 80 000 переходов случаются за миллисекунды.
+const WINDOW: Duration = Duration::from_secs(60);
 
 /// Запускает 8 потоков по 10 000 операций `hit` и возвращает управление,
 /// когда все завершились.
@@ -48,7 +53,7 @@ fn v2_no_lost_updates() {
     repo.insert(ShortLink::new("hot", "https://example.com/"))
         .unwrap();
     hammer(|| {
-        repo.record_hit("hot").unwrap();
+        repo.record_hit("hot", WINDOW).unwrap();
     });
     assert_eq!(repo.stats("hot").unwrap().hits, TOTAL);
 }
@@ -59,7 +64,7 @@ fn dashmap_no_lost_updates() {
     repo.insert(ShortLink::new("hot", "https://example.com/"))
         .unwrap();
     hammer(|| {
-        repo.record_hit("hot").unwrap();
+        repo.record_hit("hot", WINDOW).unwrap();
     });
     assert_eq!(repo.stats("hot").unwrap().hits, TOTAL);
 }

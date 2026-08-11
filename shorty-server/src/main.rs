@@ -5,13 +5,17 @@
 use std::{sync::Arc, time::Duration};
 
 use domain::LinkRepository;
-use shorty_server::{AppState, Config, build_router, cleanup};
+use shorty_server::{
+    AppState, Config, RATE_LIMIT_WINDOW, build_router, cleanup, rate_limit::SharedRateLimiter,
+};
 use storage::InMemoryRepo;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing_subscriber::EnvFilter;
 
 /// Период фоновой очистки протухших ссылок.
 const CLEANUP_PERIOD: Duration = Duration::from_secs(30);
+/// Период очистки устаревших карточек rate limiter'а.
+const RATE_LIMITER_CLEANUP_PERIOD: Duration = Duration::from_secs(60);
 /// Сколько ждём фоновые задачи при shutdown, прежде чем выйти принудительно.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -43,15 +47,23 @@ async fn shutdown_signal() {
 }
 
 async fn run() {
-    let addr = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
+    let addr = listen_addr();
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .unwrap_or_else(|e| panic!("failed to bind {addr}: {e}"));
 
     let repo: Arc<dyn LinkRepository> = Arc::new(InMemoryRepo::new());
+    let config = Arc::new(load_config());
+    // Rate limiter: лимит и потолок памяти берём из конфигурации.
+    let rate_limiter = Arc::new(SharedRateLimiter::new(
+        config.rate_limit_per_minute,
+        RATE_LIMIT_WINDOW,
+        config.rate_limit_max_clients,
+    ));
     let state = AppState {
         repo: repo.clone(),
-        config: Arc::new(Config::default()),
+        config: config.clone(),
+        rate_limiter: rate_limiter.clone(),
     };
 
     // Инфраструктура graceful shutdown: токен — «сигнал всем завершаться»,
@@ -59,6 +71,12 @@ async fn run() {
     let shutdown_token = CancellationToken::new();
     let tracker = TaskTracker::new();
     cleanup::spawn_cleaner(repo, CLEANUP_PERIOD, &tracker, shutdown_token.clone());
+    shorty_server::rate_limit::spawn_limiter_cleaner(
+        rate_limiter,
+        RATE_LIMITER_CLEANUP_PERIOD,
+        shutdown_token.clone(),
+        &tracker,
+    );
 
     tracing::info!(%addr, "shorty server listening");
 
@@ -79,6 +97,31 @@ async fn run() {
             "background tasks did not finish in time, exiting anyway"
         ),
     }
+}
+
+/// Адрес прослушивания: `LISTEN_ADDR` целиком, иначе `0.0.0.0:{PORT}`
+/// (порт по умолчанию 8080).
+fn listen_addr() -> String {
+    let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
+    std::env::var("LISTEN_ADDR").unwrap_or_else(|_| format!("0.0.0.0:{port}"))
+}
+
+/// Загрузка конфигурации из переменных окружения с разумными дефолтами.
+/// Параметры rate limiter'а и лимита тела — через `SHORTY_*`.
+fn load_config() -> Config {
+    Config {
+        max_body_bytes: env_usize("SHORTY_MAX_BODY_BYTES", 16 * 1024),
+        rate_limit_per_minute: env_usize("SHORTY_RATE_LIMIT_PER_MIN", 10),
+        rate_limit_max_clients: env_usize("SHORTY_RATE_LIMIT_MAX_CLIENTS", 10_000),
+        ..Config::default()
+    }
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 fn main() {

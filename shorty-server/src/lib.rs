@@ -6,6 +6,7 @@
 
 pub mod api;
 pub mod cleanup;
+pub mod rate_limit;
 pub mod request_id;
 
 use std::{sync::Arc, time::Duration};
@@ -15,6 +16,7 @@ use axum::{
     routing::{get, post},
 };
 use domain::LinkRepository;
+use rate_limit::SharedRateLimiter;
 use tower::ServiceBuilder;
 use tower_http::{
     limit::RequestBodyLimitLayer,
@@ -35,6 +37,10 @@ pub struct Config {
     pub request_timeout: Duration,
     /// Лимит размера тела запроса (защита от DoS гигантским телом).
     pub max_body_bytes: usize,
+    /// Максимум созданий ссылок в минуту с одного клиента (rate limit).
+    pub rate_limit_per_minute: usize,
+    /// Потолок числа одновременных карточек клиентов в rate limiter'е.
+    pub rate_limit_max_clients: usize,
 }
 
 impl Default for Config {
@@ -44,6 +50,8 @@ impl Default for Config {
             max_generate_attempts: 5,
             request_timeout: Duration::from_secs(5),
             max_body_bytes: 16 * 1024,
+            rate_limit_per_minute: 10,
+            rate_limit_max_clients: 10_000,
         }
     }
 }
@@ -57,7 +65,13 @@ pub struct AppState {
     /// в уроке 5 сюда встанет PostgreSQL без переписывания handlers.
     pub repo: Arc<dyn LinkRepository>,
     pub config: Arc<Config>,
+    /// Rate limiter для `POST /api/v1/links` (общий, разделяемый между
+    /// всеми in-flight запросами).
+    pub rate_limiter: Arc<SharedRateLimiter>,
 }
+
+/// Окно rate limit'а — одна минута (соответствует `per_minute`).
+pub const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
 
 /// Сборка приложения: маршруты + middleware-стек.
 ///
@@ -70,13 +84,13 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/links/{code}",
             get(api::handlers::get_link).delete(api::handlers::delete_link),
-        );
+        )
+        .route("/links/{code}/stats", get(api::handlers::link_stats))
+        .route("/stats/top", get(api::handlers::top_links));
 
     Router::new()
         .route("/healthz", get(api::handlers::healthz))
         .route("/version", get(api::handlers::version))
-        .route("/slow", get(api::handlers::slow))
-        .route("/slow-blocking", get(api::handlers::slow_blocking))
         .nest("/api/v1", api_v1)
         // Redirect — hot path. Статические маршруты (`/healthz`) в axum
         // имеют приоритет над шаблоном `/{code}`.

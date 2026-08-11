@@ -15,16 +15,19 @@
 //!   (check-then-act) для демонстрации потерянных обновлений.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::{
-        Arc, RwLock,
+        Arc, Mutex, RwLock,
         atomic::{AtomicU64, Ordering},
     },
-    time::SystemTime,
+    time::{Duration, Instant, SystemTime},
 };
 
 use dashmap::DashMap;
-use domain::{LinkRepository, LinkStats, RepoError, ShortLink};
+use domain::{LinkRepository, LinkStats, RepoError, ShortLink, TopLink};
+
+/// Длина окна «число переходов за последние N секунд» для `stats_window`.
+pub const HIT_WINDOW: Duration = Duration::from_secs(60);
 
 // ---------------------------------------------------------------------------
 // v1: RwLock<HashMap> с изменяемым счётчиком в значении (наследие урока 2)
@@ -92,10 +95,12 @@ impl InMemoryRepoV1 {
 // v2: read-lock + атомарный счётчик внутри Arc<LinkEntry>
 // ---------------------------------------------------------------------------
 
-/// Запись хранилища: ссылка и атомарный счётчик переходов.
+/// Запись хранилища: ссылка, атомарный счётчик переходов и скользящее окно
+/// недавних переходов (моменты времени) для подсчёта «за последние N секунд».
 pub struct LinkEntry {
     link: ShortLink,
     hits: AtomicU64,
+    recent: Mutex<VecDeque<Instant>>,
 }
 
 impl LinkEntry {
@@ -103,7 +108,39 @@ impl LinkEntry {
         Arc::new(Self {
             link,
             hits: AtomicU64::new(0),
+            recent: Mutex::new(VecDeque::new()),
         })
+    }
+
+    /// Зарегистрировать переход «сейчас»: атомарный total-инкремент
+    /// + запись момента в скользящее окно (лениво подрезаем старые).
+    fn record_hit(&self, window: Duration) -> u64 {
+        // Атомарный total-инкремент; новое значение не нужно — читаем load.
+        self.hits.fetch_add(1, Ordering::Relaxed);
+        let now = Instant::now();
+        let mut recent = self.recent.lock().expect("hit window lock poisoned");
+        recent.push_back(now);
+        while let Some(&first) = recent.front() {
+            if now.duration_since(first) <= window {
+                break;
+            }
+            recent.pop_front();
+        }
+        self.hits.load(Ordering::Relaxed)
+    }
+
+    /// Сколько переходов было за последние `window` секунд (точное
+    /// скользящее окно по фактическим моментам).
+    fn hits_last(&self, window: Duration) -> u64 {
+        let now = Instant::now();
+        let mut recent = self.recent.lock().expect("hit window lock poisoned");
+        while let Some(&first) = recent.front() {
+            if now.duration_since(first) <= window {
+                break;
+            }
+            recent.pop_front();
+        }
+        recent.len() as u64
     }
 
     fn stats(&self) -> LinkStats {
@@ -158,14 +195,38 @@ impl InMemoryRepo {
             .ok_or_else(|| RepoError::NotFound(code.to_string()))
     }
 
-    pub fn record_hit(&self, code: &str) -> Result<u64, RepoError> {
+    pub fn record_hit(&self, code: &str, window: Duration) -> Result<u64, RepoError> {
         let map = self.inner.read().expect("lock poisoned");
         let entry = map
             .get(code)
             .ok_or_else(|| RepoError::NotFound(code.to_string()))?;
-        // fetch_add возвращает старое значение; Relaxed достаточно —
-        // счётчик ни с чем не синхронизирован.
-        Ok(entry.hits.fetch_add(1, Ordering::Relaxed) + 1)
+        Ok(entry.record_hit(window))
+    }
+
+    pub fn hits_last(&self, code: &str, window: Duration) -> Result<u64, RepoError> {
+        let map = self.inner.read().expect("lock poisoned");
+        let entry = map
+            .get(code)
+            .ok_or_else(|| RepoError::NotFound(code.to_string()))?;
+        Ok(entry.hits_last(window))
+    }
+
+    /// Топ-N: собрать все ссылки, отсортировать по hits убыванием.
+    /// Чтение карты под read-lock — редкий административный запрос платит
+    /// за полный проход; конкурентные redirect на это не ждут (read-lock).
+    pub fn top(&self, limit: usize) -> Result<Vec<TopLink>, RepoError> {
+        let map = self.inner.read().expect("lock poisoned");
+        let mut all: Vec<TopLink> = map
+            .iter()
+            .map(|(code, entry)| TopLink {
+                code: code.clone(),
+                hits: entry.hits.load(Ordering::Relaxed),
+            })
+            .collect();
+        // Убывание по hits; при равенстве — по коду, для детерминизма.
+        all.sort_by(|a, b| b.hits.cmp(&a.hits).then_with(|| a.code.cmp(&b.code)));
+        all.truncate(limit);
+        Ok(all)
     }
 
     pub fn stats(&self, code: &str) -> Result<LinkStats, RepoError> {
@@ -203,11 +264,21 @@ impl LinkRepository for InMemoryRepo {
     }
 
     async fn record_hit(&self, code: &str) -> Result<u64, RepoError> {
-        InMemoryRepo::record_hit(self, code)
+        InMemoryRepo::record_hit(self, code, HIT_WINDOW)
     }
 
     async fn stats(&self, code: &str) -> Result<LinkStats, RepoError> {
         InMemoryRepo::stats(self, code)
+    }
+
+    async fn stats_window(&self, code: &str, window: Duration) -> Result<LinkStats, RepoError> {
+        let link = InMemoryRepo::get(self, code)?;
+        let hits = InMemoryRepo::hits_last(self, code, window).unwrap_or(0);
+        Ok(LinkStats { link, hits })
+    }
+
+    async fn top(&self, limit: usize) -> Result<Vec<TopLink>, RepoError> {
+        InMemoryRepo::top(self, limit)
     }
 
     async fn purge_expired(&self, now: SystemTime) -> usize {
@@ -260,12 +331,34 @@ impl DashMapRepo {
             .ok_or_else(|| RepoError::NotFound(code.to_string()))
     }
 
-    pub fn record_hit(&self, code: &str) -> Result<u64, RepoError> {
+    pub fn record_hit(&self, code: &str, window: Duration) -> Result<u64, RepoError> {
         let entry = self
             .inner
             .get(code)
             .ok_or_else(|| RepoError::NotFound(code.to_string()))?;
-        Ok(entry.hits.fetch_add(1, Ordering::Relaxed) + 1)
+        Ok(entry.record_hit(window))
+    }
+
+    pub fn hits_last(&self, code: &str, window: Duration) -> Result<u64, RepoError> {
+        let entry = self
+            .inner
+            .get(code)
+            .ok_or_else(|| RepoError::NotFound(code.to_string()))?;
+        Ok(entry.hits_last(window))
+    }
+
+    pub fn top(&self, limit: usize) -> Result<Vec<TopLink>, RepoError> {
+        let mut all: Vec<TopLink> = self
+            .inner
+            .iter()
+            .map(|entry| TopLink {
+                code: entry.link.code.clone(),
+                hits: entry.hits.load(Ordering::Relaxed),
+            })
+            .collect();
+        all.sort_by(|a, b| b.hits.cmp(&a.hits).then_with(|| a.code.cmp(&b.code)));
+        all.truncate(limit);
+        Ok(all)
     }
 
     pub fn stats(&self, code: &str) -> Result<LinkStats, RepoError> {
@@ -297,11 +390,21 @@ impl LinkRepository for DashMapRepo {
     }
 
     async fn record_hit(&self, code: &str) -> Result<u64, RepoError> {
-        DashMapRepo::record_hit(self, code)
+        DashMapRepo::record_hit(self, code, HIT_WINDOW)
     }
 
     async fn stats(&self, code: &str) -> Result<LinkStats, RepoError> {
         DashMapRepo::stats(self, code)
+    }
+
+    async fn stats_window(&self, code: &str, window: Duration) -> Result<LinkStats, RepoError> {
+        let link = DashMapRepo::get(self, code)?;
+        let hits = DashMapRepo::hits_last(self, code, window).unwrap_or(0);
+        Ok(LinkStats { link, hits })
+    }
+
+    async fn top(&self, limit: usize) -> Result<Vec<TopLink>, RepoError> {
+        DashMapRepo::top(self, limit)
     }
 
     async fn purge_expired(&self, now: SystemTime) -> usize {
@@ -405,8 +508,8 @@ mod tests {
         assert_eq!(dup, Err(RepoError::CodeTaken("rust".to_string())));
 
         assert_eq!(repo.get("rust").unwrap().target_url, link.target_url);
-        assert_eq!(repo.record_hit("rust").unwrap(), 1);
-        assert_eq!(repo.record_hit("rust").unwrap(), 2);
+        assert_eq!(repo.record_hit("rust", HIT_WINDOW).unwrap(), 1);
+        assert_eq!(repo.record_hit("rust", HIT_WINDOW).unwrap(), 2);
         assert_eq!(repo.stats("rust").unwrap().hits, 2);
 
         repo.remove("rust").unwrap();

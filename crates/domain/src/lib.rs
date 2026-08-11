@@ -4,7 +4,7 @@
 //! здесь только доменные типы и контракты (трейты), которые реализуют
 //! инфраструктурные crates (`storage`) и используют слои выше (`api`).
 
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 /// Короткая ссылка — основная доменная сущность сервиса.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,6 +24,13 @@ pub struct ShortLink {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkStats {
     pub link: ShortLink,
+    pub hits: u64,
+}
+
+/// Строка топ-N: код ссылки и суммарное число переходов
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TopLink {
+    pub code: String,
     pub hits: u64,
 }
 
@@ -69,6 +76,13 @@ pub trait LinkRepository: Send + Sync {
 
     /// Ссылка вместе со счётчиком переходов.
     async fn stats(&self, code: &str) -> Result<LinkStats, RepoError>;
+
+    /// Ссылка + число переходов **за последние `window`
+    /// (скользящее или дискретное окно — на усмотрение реализации).
+    async fn stats_window(&self, code: &str, window: Duration) -> Result<LinkStats, RepoError>;
+
+    /// N ссылок с наибольшим суммарным числом переходов, по убыванию.
+    async fn top(&self, limit: usize) -> Result<Vec<TopLink>, RepoError>;
 
     /// Удалить все ссылки с `expires_at <= now`; вернуть число удалённых.
     /// Используется фоновым уборщиком.

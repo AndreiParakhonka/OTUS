@@ -13,6 +13,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 use crate::request_id::current_request_id;
 
@@ -25,6 +26,9 @@ pub enum AppError {
     /// Код ссылки занят → 409.
     #[error("code is already taken")]
     CodeTaken,
+    /// Превышен rate limit на создание ссылок → 429 + `Retry-After`.
+    #[error("rate limit exceeded, retry later")]
+    RateLimited { retry_after: Duration },
     /// Семантически невалидные данные (URL, код, TTL) → 422.
     #[error("{0}")]
     Validation(String),
@@ -54,6 +58,7 @@ impl IntoResponse for AppError {
         let (status, code) = match &self {
             AppError::NotFound => (StatusCode::NOT_FOUND, "not_found"),
             AppError::CodeTaken => (StatusCode::CONFLICT, "code_taken"),
+            AppError::RateLimited { .. } => (StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
             AppError::Validation(_) => (StatusCode::UNPROCESSABLE_ENTITY, "validation_error"),
             AppError::InvalidBody { status, .. } => (
                 *status,
@@ -72,12 +77,28 @@ impl IntoResponse for AppError {
             }
         };
 
+        // Retry-After у 429: копия (Duration — Copy) до перемещения `self`.
+        let retry_after = match &self {
+            AppError::RateLimited { retry_after } => Some(*retry_after),
+            _ => None,
+        };
+
         let body = ErrorBody {
             code: code.to_string(),
             message: self.to_string(),
             request_id,
         };
-        (status, Json(body)).into_response()
+        let mut response: Response = (status, Json(body)).into_response();
+        if let Some(retry_after) = retry_after {
+            // `Retry-After` в секундах (минимум 1).
+            let secs = retry_after.as_secs().max(1);
+            if let Ok(value) = secs.to_string().parse() {
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::RETRY_AFTER, value);
+            }
+        }
+        response
     }
 }
 
