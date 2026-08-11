@@ -1,0 +1,18 @@
+[package]
+name = "storage"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+dashmap = { workspace = true }
+domain = { path = "../domain" }
+
+[dev-dependencies]
+criterion = { workspace = true }
+tokio = { workspace = true }
+
+[[bench]]
+name = "repo_bench"
+harness = false
